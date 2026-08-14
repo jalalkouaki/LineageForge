@@ -44,6 +44,8 @@ import {
   buildConnectorPaths,
   groupByDir,
   generateSvgExport,
+  NODE_WIDTH,
+  NODE_HEIGHT,
 } from '@/lib/lineage'
 import type { LineageNode, Edge } from '@/lib/lineage'
 
@@ -131,11 +133,37 @@ export default function Page() {
   const fileInputRef = useRef<HTMLInputElement>(null)
 
   const zoomIn = useCallback(() => setZoom((z) => Math.min(2.5, +(z + 0.15).toFixed(2))), [])
-  const zoomOut = useCallback(() => setZoom((z) => Math.max(0.4, +(z - 0.15).toFixed(2))), [])
+  const zoomOut = useCallback(() => setZoom((z) => Math.max(0.3, +(z - 0.15).toFixed(2))), [])
   const zoomFit = useCallback(() => {
-    setZoom(1)
-    setPan({ x: 0, y: 0 })
-  }, [])
+    if (scannedNodes.length === 0) {
+      setZoom(1)
+      setPan({ x: 0, y: 0 })
+      return
+    }
+
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity
+    for (const n of scannedNodes) {
+      if (n.x < minX) minX = n.x
+      if (n.x + NODE_WIDTH > maxX) maxX = n.x + NODE_WIDTH
+      if (n.y < minY) minY = n.y
+      if (n.y + NODE_HEIGHT > maxY) maxY = n.y + NODE_HEIGHT
+    }
+
+    const graphWidth = Math.max(400, maxX - minX + 120)
+    const graphHeight = Math.max(300, maxY - minY + 120)
+    const viewportWidth = typeof window !== 'undefined' ? Math.max(600, window.innerWidth - 620) : 800
+    const viewportHeight = typeof window !== 'undefined' ? Math.max(400, window.innerHeight - 140) : 600
+
+    const scaleX = viewportWidth / graphWidth
+    const scaleY = viewportHeight / graphHeight
+    const fittedZoom = Math.min(1.15, Math.max(0.4, Math.min(scaleX, scaleY)))
+
+    const centerPanX = Math.round((viewportWidth - (maxX - minX) * fittedZoom) / 2 - (minX - 40) * fittedZoom)
+    const centerPanY = Math.round((viewportHeight - (maxY - minY) * fittedZoom) / 2 - (minY - 40) * fittedZoom)
+
+    setZoom(+fittedZoom.toFixed(2))
+    setPan({ x: centerPanX, y: centerPanY })
+  }, [scannedNodes])
 
   // Clear any old stored dummy cache on initial startup
   useEffect(() => {
@@ -147,6 +175,14 @@ export default function Page() {
       }
     } catch {}
   }, [])
+
+  // Auto frame graph viewport when nodes change
+  useEffect(() => {
+    if (scannedNodes.length > 0) {
+      const timer = setTimeout(() => zoomFit(), 50)
+      return () => clearTimeout(timer)
+    }
+  }, [scannedNodes.length, zoomFit])
 
   const updateSetting = (key: keyof typeof settings, val: any) => {
     setSettings((prev) => {
@@ -280,8 +316,6 @@ export default function Page() {
         if (settings.autoExpandFolders) {
           setExpanded(groups.map((g) => g.dir))
         }
-        setZoom(1)
-        setPan({ x: 0, y: 0 })
       } catch (err: any) {
         if (err?.name !== 'AbortError') {
           console.error('Scan failed:', err)
@@ -340,8 +374,6 @@ export default function Page() {
         setExpanded(groups.map((g) => g.dir))
       }
       setScanning(false)
-      setZoom(1)
-      setPan({ x: 0, y: 0 })
     },
     [settings.autoExpandFolders],
   )
@@ -358,6 +390,60 @@ export default function Page() {
       setScanning(false)
     }
   }, [doScan, uploadedFiles])
+
+  // Node Drag & Repositioning state
+  const draggedNodeRef = useRef<{
+    id: string
+    startX: number
+    startY: number
+    initX: number
+    initY: number
+    hasMoved: boolean
+  } | null>(null)
+
+  const handleNodePointerDown = (e: React.PointerEvent<HTMLDivElement>, node: LineageNode) => {
+    e.stopPropagation()
+    draggedNodeRef.current = {
+      id: node.id,
+      startX: e.clientX,
+      startY: e.clientY,
+      initX: node.x,
+      initY: node.y,
+      hasMoved: false,
+    }
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId)
+    } catch {}
+  }
+
+  const handleNodePointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!draggedNodeRef.current) return
+    e.stopPropagation()
+    const dx = (e.clientX - draggedNodeRef.current.startX) / zoom
+    const dy = (e.clientY - draggedNodeRef.current.startY) / zoom
+    if (Math.abs(dx) > 3 || Math.abs(dy) > 3) {
+      draggedNodeRef.current.hasMoved = true
+    }
+    const targetId = draggedNodeRef.current.id
+    const newX = Math.round(draggedNodeRef.current.initX + dx)
+    const newY = Math.round(draggedNodeRef.current.initY + dy)
+    setScannedNodes((prev) =>
+      prev.map((n) => (n.id === targetId ? { ...n, x: newX, y: newY } : n)),
+    )
+  }
+
+  const handleNodePointerUp = (e: React.PointerEvent<HTMLDivElement>, node: LineageNode) => {
+    if (draggedNodeRef.current) {
+      e.stopPropagation()
+      if (!draggedNodeRef.current.hasMoved) {
+        setSelected(node.id)
+      }
+      try {
+        e.currentTarget.releasePointerCapture(e.pointerId)
+      } catch {}
+      draggedNodeRef.current = null
+    }
+  }
 
   // Robust Canvas Pan & Drag with Pointer Capture
   const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
@@ -803,70 +889,145 @@ export default function Page() {
               >
                 {/* SVG Connector Edge Layer */}
                 <svg
-                  className="absolute inset-0 w-[1400px] h-[900px] pointer-events-none overflow-visible"
+                  className="absolute inset-0 pointer-events-none overflow-visible"
+                  style={{ width: '5000px', height: '4000px' }}
                   aria-hidden="true"
                 >
                   <defs>
-                    <linearGradient id="edge-grad" x1="0%" y1="0%" x2="100%" y2="0%">
-                      <stop offset="0%" stopColor="#a855f7" />
-                      <stop offset="50%" stopColor="#ec4899" />
-                      <stop offset="100%" stopColor="#4facfe" />
-                    </linearGradient>
-                    <linearGradient id="highlight-grad" x1="0%" y1="0%" x2="100%" y2="0%">
-                      <stop offset="0%" stopColor="#43e97b" />
+                    <linearGradient id="edge-grad-default" x1="0%" y1="0%" x2="100%" y2="0%">
+                      <stop offset="0%" stopColor="#4facfe" />
                       <stop offset="100%" stopColor="#00f2fe" />
                     </linearGradient>
+                    <linearGradient id="edge-grad-upstream" x1="0%" y1="0%" x2="100%" y2="0%">
+                      <stop offset="0%" stopColor="#43e97b" />
+                      <stop offset="100%" stopColor="#38ef7d" />
+                    </linearGradient>
+                    <linearGradient id="edge-grad-downstream" x1="0%" y1="0%" x2="100%" y2="0%">
+                      <stop offset="0%" stopColor="#fa709a" />
+                      <stop offset="100%" stopColor="#ec4899" />
+                    </linearGradient>
+                    <linearGradient id="edge-grad-dim" x1="0%" y1="0%" x2="100%" y2="0%">
+                      <stop offset="0%" stopColor="#4b4b66" />
+                      <stop offset="100%" stopColor="#32324a" />
+                    </linearGradient>
 
+                    {/* Standard Cyan Arrow Marker */}
                     <marker
-                      id="forge-arrow"
-                      viewBox="0 0 10 10"
-                      refX="8"
-                      refY="5"
-                      markerWidth="6"
-                      markerHeight="6"
-                      orient="auto-start-reverse"
+                      id="forge-arrow-default"
+                      viewBox="0 0 12 12"
+                      refX="11"
+                      refY="6"
+                      markerWidth="8"
+                      markerHeight="8"
+                      orient="auto"
                     >
-                      <path d="M 0 1 L 10 5 L 0 9 z" fill="#a855f7" />
+                      <path d="M 1 2 L 11 6 L 1 10 L 4 6 Z" fill="#00f2fe" />
                     </marker>
+
+                    {/* Upstream Mint Green Arrow Marker */}
                     <marker
-                      id="forge-arrow-highlight"
-                      viewBox="0 0 10 10"
-                      refX="8"
-                      refY="5"
+                      id="forge-arrow-upstream"
+                      viewBox="0 0 12 12"
+                      refX="11"
+                      refY="6"
+                      markerWidth="9"
+                      markerHeight="9"
+                      orient="auto"
+                    >
+                      <path d="M 1 2 L 11 6 L 1 10 L 4 6 Z" fill="#43e97b" />
+                    </marker>
+
+                    {/* Downstream Pink Arrow Marker */}
+                    <marker
+                      id="forge-arrow-downstream"
+                      viewBox="0 0 12 12"
+                      refX="11"
+                      refY="6"
+                      markerWidth="9"
+                      markerHeight="9"
+                      orient="auto"
+                    >
+                      <path d="M 1 2 L 11 6 L 1 10 L 4 6 Z" fill="#fa709a" />
+                    </marker>
+
+                    {/* Dimmed Arrow Marker */}
+                    <marker
+                      id="forge-arrow-dim"
+                      viewBox="0 0 12 12"
+                      refX="11"
+                      refY="6"
                       markerWidth="7"
                       markerHeight="7"
-                      orient="auto-start-reverse"
+                      orient="auto"
                     >
-                      <path d="M 0 1 L 10 5 L 0 9 z" fill="#00f2fe" />
+                      <path d="M 1 2 L 11 6 L 1 10 L 4 6 Z" fill="#626282" opacity="0.5" />
                     </marker>
                   </defs>
 
-                  {/* Regular Edges */}
-                  {connectors.normal && (
-                    <path
-                      d={connectors.normal}
-                      fill="none"
-                      stroke="url(#edge-grad)"
-                      strokeWidth="2"
-                      className={`opacity-70 ${settings.enableEdgeFlow ? 'flowing-edge' : ''}`}
-                      markerEnd="url(#forge-arrow)"
-                    />
-                  )}
+                  {/* Individual Connector Edge Paths */}
+                  {connectors.edges.map((edge) => {
+                    const isSelectedContext = !!selected
+                    const strokeGrad = edge.isUpstream
+                      ? 'url(#edge-grad-upstream)'
+                      : edge.isDownstream
+                      ? 'url(#edge-grad-downstream)'
+                      : isSelectedContext
+                      ? 'url(#edge-grad-dim)'
+                      : 'url(#edge-grad-default)'
 
-                  {/* Highlighted Selected Edges */}
-                  {connectors.highlight && (
-                    <path
-                      d={connectors.highlight}
-                      fill="none"
-                      stroke="url(#highlight-grad)"
-                      strokeWidth="3.2"
-                      className={`opacity-100 ${settings.enableEdgeFlow ? 'flowing-edge-fast' : ''}`}
-                      style={{
-                        filter: settings.enableGlow ? 'drop-shadow(0 0 8px rgba(0, 242, 254, 0.8))' : undefined,
-                      }}
-                      markerEnd="url(#forge-arrow-highlight)"
-                    />
-                  )}
+                    const marker = edge.isUpstream
+                      ? 'url(#forge-arrow-upstream)'
+                      : edge.isDownstream
+                      ? 'url(#forge-arrow-downstream)'
+                      : isSelectedContext
+                      ? 'url(#forge-arrow-dim)'
+                      : 'url(#forge-arrow-default)'
+
+                    const strokeWidth = edge.isHighlighted ? 3.2 : isSelectedContext ? 1.4 : 2.2
+                    const opacity = edge.isHighlighted ? 1 : isSelectedContext ? 0.35 : 0.85
+
+                    return (
+                      <g key={edge.id} className="transition-opacity duration-200">
+                        {/* Glow halo on highlighted links */}
+                        {edge.isHighlighted && settings.enableGlow && (
+                          <path
+                            d={edge.d}
+                            fill="none"
+                            stroke={edge.isUpstream ? '#43e97b' : '#fa709a'}
+                            strokeWidth={strokeWidth + 4}
+                            opacity={0.35}
+                            style={{ filter: 'blur(3px)' }}
+                          />
+                        )}
+
+                        {/* Main connector curve with crisp arrowhead */}
+                        <path
+                          d={edge.d}
+                          fill="none"
+                          stroke={strokeGrad}
+                          strokeWidth={strokeWidth}
+                          opacity={opacity}
+                          className={
+                            settings.enableEdgeFlow
+                              ? edge.isHighlighted
+                                ? 'flowing-edge-fast'
+                                : 'flowing-edge'
+                              : undefined
+                          }
+                          markerEnd={marker}
+                        />
+
+                        {/* Source Port Dot */}
+                        <circle
+                          cx={edge.x1}
+                          cy={edge.y1}
+                          r={edge.isHighlighted ? 3.5 : 2.5}
+                          fill={edge.isHighlighted ? (edge.isUpstream ? '#43e97b' : '#fa709a') : '#00f2fe'}
+                          opacity={opacity}
+                        />
+                      </g>
+                    )
+                  })}
                 </svg>
 
                 {/* Interactive Nodes */}
@@ -880,22 +1041,23 @@ export default function Page() {
                     <div
                       key={node.id}
                       style={{
-                        left: `${node.x}%`,
-                        top: `${node.y}%`,
-                        transform: 'translate(-0%, -50%)',
+                        position: 'absolute',
+                        left: `${node.x}px`,
+                        top: `${node.y}px`,
+                        width: `${NODE_WIDTH}px`,
+                        height: `${NODE_HEIGHT}px`,
                       }}
-                      className="absolute node-card cursor-pointer select-none"
-                      onClick={(e) => {
-                        e.stopPropagation()
-                        setSelected(node.id)
-                      }}
+                      className="node-card cursor-grab active:cursor-grabbing select-none"
+                      onPointerDown={(e) => handleNodePointerDown(e, node)}
+                      onPointerMove={handleNodePointerMove}
+                      onPointerUp={(e) => handleNodePointerUp(e, node)}
                     >
                       {/* Node Selection Ripple Wave */}
                       {isSelected && settings.enableGlow && <div className="node-ripple" />}
 
                       {/* Node Card */}
                       <div
-                        className={`relative flex items-center gap-3 px-3.5 py-2.5 rounded-xl border backdrop-blur-xl transition-all duration-200 ${
+                        className={`relative w-full h-full flex items-center gap-2.5 px-3 py-2 rounded-xl border backdrop-blur-xl transition-all duration-150 ${
                           isSelected
                             ? `bg-[#151934] border-[#00f2fe] ${settings.enableGlow ? 'shadow-[0_0_30px_rgba(0,242,254,0.5)]' : ''} scale-105`
                             : isUpstream
@@ -911,9 +1073,25 @@ export default function Page() {
                               : undefined,
                         }}
                       >
+                        {/* Left Input Port Dot */}
+                        <div
+                          className="absolute -left-1.5 top-1/2 -translate-y-1/2 w-2.5 h-2.5 rounded-full border border-[#121428] shadow-sm pointer-events-none"
+                          style={{
+                            backgroundColor: isUpstream ? '#43e97b' : isSelected ? '#00f2fe' : '#4facfe',
+                          }}
+                        />
+
+                        {/* Right Output Port Dot */}
+                        <div
+                          className="absolute -right-1.5 top-1/2 -translate-y-1/2 w-2.5 h-2.5 rounded-full border border-[#121428] shadow-sm pointer-events-none"
+                          style={{
+                            backgroundColor: isDownstream ? '#fa709a' : isSelected ? '#00f2fe' : '#00f2fe',
+                          }}
+                        />
+
                         {/* Node Icon Badge */}
                         <div
-                          className="flex items-center justify-center w-8 h-8 rounded-lg border text-white font-bold"
+                          className="flex items-center justify-center w-7 h-7 shrink-0 rounded-lg border text-white font-bold"
                           style={{
                             backgroundColor: `${cfg.color}18`,
                             borderColor: `${cfg.color}50`,
@@ -925,13 +1103,13 @@ export default function Page() {
                         </div>
 
                         {/* Node Text & Type Details */}
-                        <div className="flex flex-col min-w-[120px] max-w-[190px]">
-                          <span className="font-mono text-xs font-bold text-white truncate tracking-tight drop-shadow-md">
+                        <div className="flex flex-col min-w-0 flex-1 overflow-hidden">
+                          <span className="font-mono text-xs font-bold text-white truncate tracking-tight drop-shadow-md" title={node.name}>
                             {node.name}
                           </span>
                           <div className="flex items-center gap-1.5 mt-0.5">
                             <span
-                              className="px-1.5 py-0.2 rounded text-[9px] font-mono font-bold tracking-wider uppercase border"
+                              className="px-1.5 py-0.2 rounded text-[9px] font-mono font-bold tracking-wider uppercase border shrink-0"
                               style={{
                                 backgroundColor: `${cfg.color}15`,
                                 color: cfg.color,
@@ -941,7 +1119,7 @@ export default function Page() {
                               {node.kind}
                             </span>
                             {settings.showColBadges && node.columns && (
-                              <span className="text-[9px] font-mono text-[#a0a0b8]">
+                              <span className="text-[9px] font-mono text-[#a0a0b8] truncate">
                                 {node.columns.length} cols
                               </span>
                             )}

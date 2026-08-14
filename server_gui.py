@@ -62,7 +62,7 @@ class ServerGUI:
         self.url_label.bind("<Button-1>", self.open_url)
         self.url_label.bind("<Double-Button-1>", self.copy_url)
 
-        hint_label = ttk.Label(url_frame, text="Click to open • Double-click to copy", font=("Segoe UI", 8))
+        hint_label = ttk.Label(url_frame, text="Click to open ", font=("Segoe UI", 8))
         hint_label.pack(anchor=tk.W, pady=(2, 0))
 
         self.status_var = tk.StringVar(value="Ready")

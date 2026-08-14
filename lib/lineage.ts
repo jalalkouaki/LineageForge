@@ -14,6 +14,28 @@ export type Edge = { from: string; to: string; columns?: { fromCol: string; toCo
 export type ParsedObject = { kind: NodeKind; filePath: string; refs: string[]; columns: ColumnLineage[] }
 export type TreeGroup = { dir: string; items: LineageNode[] }
 
+export type ConnectorEdge = {
+  id: string
+  from: string
+  to: string
+  d: string
+  x1: number
+  y1: number
+  x2: number
+  y2: number
+  isHighlighted: boolean
+  isUpstream: boolean
+  isDownstream: boolean
+  columns?: { fromCol: string; toCol: string }[]
+}
+
+export const NODE_WIDTH = 220
+export const NODE_HEIGHT = 60
+export const COL_GAP = 140
+export const ROW_GAP = 36
+export const START_X = 60
+export const START_Y = 80
+
 export async function readDirectoryRecursive(
   dirHandle: FileSystemDirectoryHandle,
   path = '',
@@ -51,44 +73,72 @@ const SQL_RESERVED = new Set([
   'first','next','only','over','partition','row_number','rank','dense_rank',
   'insert','update','delete','drop','alter','index','constraint','primary',
   'foreign','key','references','default','check','unique','cascade','restrict',
-  'lateral','unnest','generate_series','information_schema',
+  'lateral','unnest','generate_series','information_schema','using','table',
+  'view','database','schema','temporary','temp','unlogged','materialized',
 ])
 
-function stripCommentsAndStrings(sql: string): string {
+function stripComments(sql: string): string {
   return sql
-    .replace(/--[^\n]*/g, '')
-    .replace(/\/\*[\s\S]*?\*\//g, '')
-    .replace(/'[^']*'/g, "''")
+    .replace(/--[^\n]*/g, ' ')
+    .replace(/\/\*[\s\S]*?\*\//g, ' ')
+}
+
+function stripCommentsAndStrings(sql: string): string {
+  return stripComments(sql)
+    .replace(/'(?:''|[^'])*'/g, "''")
+    .replace(/\$\$[\s\S]*?\$\$/g, "''")
+}
+
+function cleanIdentifier(raw: string): string {
+  if (!raw) return ''
+  return raw
+    .trim()
+    .replace(/^[\["`']+|[\]"`']+$/g, '')
+    .split('.')
+    .pop()!
+    .toLowerCase()
 }
 
 function extractCteNames(sql: string): Set<string> {
   const clean = stripCommentsAndStrings(sql)
   const ctes = new Set<string>()
-  const withMatch = clean.match(/\bwith\s+([a-zA-Z_]\w*)\s+as\s*\(/i)
+  const withMatch = clean.match(/\bwith\s+([a-zA-Z_`"\[][\w.`"\]]*)\s+as\s*\(/i)
   if (withMatch) {
-    ctes.add(withMatch[1].toLowerCase())
-    // Multiple CTEs separated by commas: , cte_name as (
-    const extraCtes = clean.matchAll(/,\s*([a-zA-Z_]\w*)\s+as\s*\(/gi)
+    const name = cleanIdentifier(withMatch[1])
+    if (name && !SQL_RESERVED.has(name)) ctes.add(name)
+    const extraCtes = clean.matchAll(/,\s*([a-zA-Z_`"\[][\w.`"\]]*)\s+as\s*\(/gi)
     for (const match of extraCtes) {
-      ctes.add(match[1].toLowerCase())
+      const extraName = cleanIdentifier(match[1])
+      if (extraName && !SQL_RESERVED.has(extraName)) ctes.add(extraName)
     }
   }
   return ctes
 }
 
 function splitStatements(sql: string): string[] {
+  const clean = stripComments(sql)
   const stmts: string[] = []
   let depth = 0
   let start = 0
-  for (let i = 0; i < sql.length; i++) {
-    if (sql[i] === '(') depth++
-    else if (sql[i] === ')') depth--
-    else if (sql[i] === ';' && depth === 0) {
-      stmts.push(sql.substring(start, i).trim())
+  let inSingleQuote = false
+
+  for (let i = 0; i < clean.length; i++) {
+    const char = clean[i]
+    if (char === "'" && clean[i - 1] !== '\\') {
+      inSingleQuote = !inSingleQuote
+      continue
+    }
+    if (inSingleQuote) continue
+
+    if (char === '(') depth++
+    else if (char === ')' && depth > 0) depth--
+    else if (char === ';' && depth === 0) {
+      const stmt = clean.substring(start, i).trim()
+      if (stmt) stmts.push(stmt)
       start = i + 1
     }
   }
-  const rem = sql.substring(start).trim()
+  const rem = clean.substring(start).trim()
   if (rem) stmts.push(rem)
   return stmts
 }
@@ -97,26 +147,43 @@ function extractTableRefs(sql: string, selfName: string): string[] {
   const clean = stripCommentsAndStrings(sql)
   const refs = new Set<string>()
   const cteNames = extractCteNames(sql)
+  const normalizedSelf = cleanIdentifier(selfName)
 
-  const fromJoinPattern = /\b(?:from|join|into|table)\s+([a-zA-Z_][\w.]*)/gi
-  let match
+  // 1. Standard FROM / JOIN / INTO clauses
+  const fromJoinPattern = /\b(?:from|join|into|table|references)\s+([a-zA-Z_`"\[][\w.`"\]]*)/gi
+  let match: RegExpExecArray | null
   while ((match = fromJoinPattern.exec(clean)) !== null) {
-    const raw = match[1].toLowerCase()
-    const name = raw.split('.').pop()!
-    if (!SQL_RESERVED.has(name) && name !== selfName && !cteNames.has(name) && !/^\d+$/.test(name)) {
+    const name = cleanIdentifier(match[1])
+    if (name && !SQL_RESERVED.has(name) && name !== normalizedSelf && !cteNames.has(name) && !/^\d+$/.test(name)) {
       refs.add(name)
     }
   }
 
-  const dbtRefPattern = /\{\{\s*ref\s*\(\s*['"]([^'"]+)['"]\s*\)\s*\}\}/g
-  while ((match = dbtRefPattern.exec(clean)) !== null) {
-    const name = match[1].toLowerCase()
-    if (name !== selfName) refs.add(name)
+  // 2. Comma-separated tables in FROM clause: FROM a, b, c
+  const fromClauseMatch = clean.match(/\bfrom\s+([^;]+?)(?:\bwhere\b|\bgroup\b|\border\b|\bhaving\b|\bjoin\b|\bleft\b|\bright\b|\bfull\b|\binner\b|\bcross\b|\bunion\b|\blimit\b|;|$)/i)
+  if (fromClauseMatch) {
+    const rawList = fromClauseMatch[1].split(',')
+    for (const item of rawList) {
+      const candidate = item.trim().split(/\s+/)[0]
+      const name = cleanIdentifier(candidate)
+      if (name && !SQL_RESERVED.has(name) && name !== normalizedSelf && !cteNames.has(name) && !/^\d+$/.test(name)) {
+        refs.add(name)
+      }
+    }
   }
 
+  // 3. dbt ref() macro
+  const dbtRefPattern = /\{\{\s*ref\s*\(\s*['"]([^'"]+)['"]\s*\)\s*\}\}/g
+  while ((match = dbtRefPattern.exec(clean)) !== null) {
+    const name = cleanIdentifier(match[1])
+    if (name && name !== normalizedSelf) refs.add(name)
+  }
+
+  // 4. dbt source() macro
   const dbtSourcePattern = /\{\{\s*source\s*\(\s*['"][^'"]+['"]\s*,\s*['"]([^'"]+)['"]\s*\)\s*\}\}/g
   while ((match = dbtSourcePattern.exec(clean)) !== null) {
-    refs.add(match[1].toLowerCase())
+    const name = cleanIdentifier(match[1])
+    if (name && name !== normalizedSelf) refs.add(name)
   }
 
   return [...refs]
@@ -133,12 +200,15 @@ function extractTableColumns(stmt: string): ColumnLineage[] {
     const trimmed = def.trim()
     if (/^(primary|foreign|constraint|unique|check|index)/i.test(trimmed)) continue
     const parts = trimmed.split(/\s+/)
-    if (parts.length >= 2 && !SQL_RESERVED.has(parts[0].toLowerCase())) {
-      columns.push({
-        name: parts[0].replace(/["`]/g, '').toLowerCase(),
-        type: parts[1].replace(/["`]/g, '').toUpperCase(),
-        sources: [],
-      })
+    if (parts.length >= 2) {
+      const colName = cleanIdentifier(parts[0])
+      if (colName && !SQL_RESERVED.has(colName)) {
+        columns.push({
+          name: colName,
+          type: parts[1].replace(/["`]/g, '').toUpperCase(),
+          sources: [],
+        })
+      }
     }
   }
   return columns
@@ -156,26 +226,26 @@ function extractSelectColumns(stmt: string, sourceRefs: string[]): ColumnLineage
     const trimmed = rawCol.trim()
     if (!trimmed || trimmed === '*') continue
 
-    const asMatch = trimmed.match(/\s+as\s+([\w"`]+)$/i)
+    const asMatch = trimmed.match(/\s+as\s+([a-zA-Z_`"\[][\w.`"\]]*)$/i)
     let colName = ''
     let expr = trimmed
 
     if (asMatch) {
-      colName = asMatch[1].replace(/["`]/g, '').toLowerCase()
+      colName = cleanIdentifier(asMatch[1])
       expr = trimmed.substring(0, asMatch.index).trim()
     } else {
       const parts = trimmed.split(/\s+/)
-      colName = parts[parts.length - 1].replace(/["`]/g, '').toLowerCase()
+      colName = cleanIdentifier(parts[parts.length - 1])
     }
 
-    if (SQL_RESERVED.has(colName) || /^\d+$/.test(colName)) continue
+    if (!colName || SQL_RESERVED.has(colName) || /^\d+$/.test(colName)) continue
 
     const sources: { table: string; column: string }[] = []
     const dotMatches = expr.matchAll(/([a-zA-Z_]\w*)\.([a-zA-Z_]\w*)/g)
     for (const dm of dotMatches) {
-      const tbl = dm[1].toLowerCase()
-      const col = dm[2].toLowerCase()
-      if (!SQL_RESERVED.has(col)) {
+      const tbl = cleanIdentifier(dm[1])
+      const col = cleanIdentifier(dm[2])
+      if (tbl && col && !SQL_RESERVED.has(col)) {
         sources.push({ table: tbl, column: col })
       }
     }
@@ -186,14 +256,14 @@ function extractSelectColumns(stmt: string, sourceRefs: string[]): ColumnLineage
       if (funcMatch) {
         const innerCols = bareCol.matchAll(/\b(\w+)\b/g)
         for (const ic of innerCols) {
-          const icName = ic[1].toLowerCase()
-          if (!SQL_RESERVED.has(icName) && icName !== funcMatch[1].toLowerCase() && !/^\d+$/.test(icName)) {
+          const icName = cleanIdentifier(ic[1])
+          if (icName && !SQL_RESERVED.has(icName) && icName !== funcMatch[1].toLowerCase() && !/^\d+$/.test(icName)) {
             sources.push({ table: sourceRefs[0], column: icName })
           }
         }
       } else {
-        const simpleCol = bareCol.replace(/["`]/g, '').toLowerCase()
-        if (!SQL_RESERVED.has(simpleCol) && !/^\d+$/.test(simpleCol)) {
+        const simpleCol = cleanIdentifier(bareCol)
+        if (simpleCol && !SQL_RESERVED.has(simpleCol) && !/^\d+$/.test(simpleCol)) {
           sources.push({ table: sourceRefs[0], column: simpleCol })
         }
       }
@@ -205,13 +275,6 @@ function extractSelectColumns(stmt: string, sourceRefs: string[]): ColumnLineage
   return cols
 }
 
-/**
- * Smart classification of node kind:
- * - 'source': Raw input tables, ingested seeds, external databases, or tables referenced in FROM/JOIN that are not defined inside workspace
- * - 'model': Data transformation models, dbt models, staging/marts/intermediate queries, SELECT pipelines
- * - 'view': Virtual views (CREATE VIEW / MATERIALIZED VIEW)
- * - 'table': Physical storage tables / DDL created tables
- */
 function classifyNodeKind(
   name: string,
   filePath: string,
@@ -222,7 +285,6 @@ function classifyNodeKind(
   const lowerPath = filePath.toLowerCase()
   const lowerName = name.toLowerCase()
 
-  // 1. Source checks
   if (
     lowerPath.includes('sources/') ||
     lowerPath.includes('sources\\') ||
@@ -243,7 +305,6 @@ function classifyNodeKind(
     return 'source'
   }
 
-  // 2. View checks
   if (
     lowerPath.includes('views/') ||
     lowerPath.includes('views\\') ||
@@ -254,7 +315,6 @@ function classifyNodeKind(
     return 'view'
   }
 
-  // 3. Model checks
   if (
     lowerPath.includes('models/') ||
     lowerPath.includes('models\\') ||
@@ -276,8 +336,7 @@ function classifyNodeKind(
     return 'model'
   }
 
-  // Default to model for transformation SQL files
-  return 'model'
+  return 'table'
 }
 
 export function parseFiles(files: { name: string; path: string; content: string }[]) {
@@ -287,11 +346,10 @@ export function parseFiles(files: { name: string; path: string; content: string 
   for (const file of files) {
     if (file.name.endsWith('.yml') || file.name.endsWith('.yaml')) {
       const content = file.content
-      // Simple regex parser for dbt-style sources
-      const sourceMatches = content.matchAll(/name:\s*([a-zA-Z_]\w*)/g)
+      const sourceMatches = content.matchAll(/name:\s*([a-zA-Z_`"\[][\w.`"\]]*)/g)
       for (const sm of sourceMatches) {
-        const objName = sm[1].toLowerCase()
-        if (objName && !nodeMap.has(objName)) {
+        const objName = cleanIdentifier(sm[1])
+        if (objName && !nodeMap.has(objName) && !SQL_RESERVED.has(objName)) {
           const kind: NodeKind = file.path.includes('sources') || objName.startsWith('raw_') || objName.startsWith('src_')
             ? 'source'
             : 'model'
@@ -310,21 +368,22 @@ export function parseFiles(files: { name: string; path: string; content: string 
   for (const file of files) {
     if (file.name.endsWith('.sql')) {
       const statements = splitStatements(file.content)
-      const baseFileName = file.name.replace(/\.[^.]+$/, '').toLowerCase()
+      const baseFileName = cleanIdentifier(file.name.replace(/\.[^.]+$/, ''))
 
       for (const stmt of statements) {
         const tableMatch = stmt.match(
-          /create\s+(?:or\s+replace\s+)?table\s+(?:if\s+not\s+exists\s+)?(?:[\w"`.]+\.)?([\w"`.]+)/i,
+          /create\s+(?:or\s+replace\s+)?(?:temporary\s+|temp\s+|unlogged\s+)?table\s+(?:if\s+not\s+exists\s+)?([a-zA-Z_`"\[][\w.`"\]]*)/i,
         )
         const viewMatch = stmt.match(
-          /create\s+(?:or\s+replace\s+)?(?:materialized\s+)?view\s+(?:if\s+not\s+exists\s+)?(?:[\w"`.]+\.)?([\w"`.]+)/i,
+          /create\s+(?:or\s+replace\s+)?(?:materialized\s+)?view\s+(?:if\s+not\s+exists\s+)?([a-zA-Z_`"\[][\w.`"\]]*)/i,
         )
         const insertMatch = stmt.match(
-          /insert\s+into\s+(?:[\w"`.]+\.)?([\w"`.]+)/i,
+          /insert\s+into\s+([a-zA-Z_`"\[][\w.`"\]]*)/i,
         )
 
         if (tableMatch) {
-          const objectName = tableMatch[1].replace(/["`]/g, '').toLowerCase()
+          const objectName = cleanIdentifier(tableMatch[1])
+          if (!objectName) continue
           const columns = extractTableColumns(stmt)
           const refs = extractTableRefs(stmt, objectName)
 
@@ -334,7 +393,6 @@ export function parseFiles(files: { name: string; path: string; content: string 
             if (selectCols.length > 0) columns.push(...selectCols)
           }
 
-          // If it's a CTAS or inside models/staging/marts directory, classify as 'model', else 'table'
           const kind: NodeKind = isCTAS || file.path.includes('models') || file.path.includes('staging') || objectName.startsWith('stg_') || objectName.startsWith('fct_') || objectName.startsWith('dim_')
             ? classifyNodeKind(objectName, file.path, 'model')
             : classifyNodeKind(objectName, file.path, 'table')
@@ -348,7 +406,8 @@ export function parseFiles(files: { name: string; path: string; content: string 
             nodeMap.set(objectName, { kind, filePath: file.path, refs, columns })
           }
         } else if (viewMatch) {
-          const objectName = viewMatch[1].replace(/["`]/g, '').toLowerCase()
+          const objectName = cleanIdentifier(viewMatch[1])
+          if (!objectName) continue
           const refs = extractTableRefs(stmt, objectName)
           const columns = extractSelectColumns(stmt, refs)
 
@@ -361,7 +420,8 @@ export function parseFiles(files: { name: string; path: string; content: string 
             nodeMap.set(objectName, { kind: 'view', filePath: file.path, refs, columns })
           }
         } else if (insertMatch) {
-          const objectName = insertMatch[1].replace(/["`]/g, '').toLowerCase()
+          const objectName = cleanIdentifier(insertMatch[1])
+          if (!objectName) continue
           const refs = extractTableRefs(stmt, objectName)
           const columns = extractSelectColumns(stmt, refs)
           const kind = classifyNodeKind(objectName, file.path)
@@ -374,7 +434,6 @@ export function parseFiles(files: { name: string; path: string; content: string 
             nodeMap.set(objectName, { kind, filePath: file.path, refs, columns })
           }
         } else if (/select\b/i.test(stmt)) {
-          // Standard transformation SQL / dbt model file
           const refs = extractTableRefs(stmt, baseFileName)
           const columns = extractSelectColumns(stmt, refs)
           const kind = classifyNodeKind(baseFileName, file.path, 'model')
@@ -389,39 +448,42 @@ export function parseFiles(files: { name: string; path: string; content: string 
           }
         }
 
-        // dbt jinja ref & source parsing
-        const stmtObjectName = tableMatch?.[1]?.replace(/["`]/g, '').toLowerCase()
-          ?? viewMatch?.[1]?.replace(/["`]/g, '').toLowerCase()
-          ?? baseFileName
+        const stmtObjectName = tableMatch ? cleanIdentifier(tableMatch[1])
+          : viewMatch ? cleanIdentifier(viewMatch[1])
+          : insertMatch ? cleanIdentifier(insertMatch[1])
+          : baseFileName
 
-        const dbtRefPattern = /\{\{\s*ref\s*\(\s*['"]([^'"]+)['"]\s*\)\s*\}\}/g
-        let dbtMatch
-        while ((dbtMatch = dbtRefPattern.exec(stmt)) !== null) {
-          const ref = dbtMatch[1].toLowerCase()
-          if (ref !== stmtObjectName) {
-            const entry = nodeMap.get(stmtObjectName)
-            if (entry) entry.refs.push(ref)
+        if (stmtObjectName) {
+          const dbtRefPattern = /\{\{\s*ref\s*\(\s*['"]([^'"]+)['"]\s*\)\s*\}\}/g
+          let dbtMatch: RegExpExecArray | null
+          while ((dbtMatch = dbtRefPattern.exec(stmt)) !== null) {
+            const ref = cleanIdentifier(dbtMatch[1])
+            if (ref && ref !== stmtObjectName) {
+              const entry = nodeMap.get(stmtObjectName)
+              if (entry && !entry.refs.includes(ref)) entry.refs.push(ref)
+            }
           }
-        }
 
-        const dbtSourcePattern = /\{\{\s*source\s*\(\s*['"][^'"]+['"]\s*,\s*['"]([^'"]+)['"]\s*\)\s*\}\}/g
-        while ((dbtMatch = dbtSourcePattern.exec(stmt)) !== null) {
-          const ref = dbtMatch[1].toLowerCase()
-          if (!nodeMap.has(ref)) {
-            nodeMap.set(ref, { kind: 'source', filePath: `sources/${ref}`, refs: [], columns: [] })
+          const dbtSourcePattern = /\{\{\s*source\s*\(\s*['"][^'"]+['"]\s*,\s*['"]([^'"]+)['"]\s*\)\s*\}\}/g
+          while ((dbtMatch = dbtSourcePattern.exec(stmt)) !== null) {
+            const ref = cleanIdentifier(dbtMatch[1])
+            if (ref && ref !== stmtObjectName) {
+              if (!nodeMap.has(ref)) {
+                nodeMap.set(ref, { kind: 'source', filePath: `sources/${ref}`, refs: [], columns: [] })
+              }
+              const entry = nodeMap.get(stmtObjectName)
+              if (entry && !entry.refs.includes(ref)) entry.refs.push(ref)
+            }
           }
-          const entry = nodeMap.get(stmtObjectName)
-          if (entry) entry.refs.push(ref)
         }
       }
     }
   }
 
-  // 3. Process Inferred Upstream Tables (Tables referenced in FROM/JOIN that are external/source inputs)
+  // 3. Inferred external upstream references
   for (const [name, data] of [...nodeMap.entries()]) {
     for (const ref of data.refs) {
       if (!nodeMap.has(ref)) {
-        // Any referenced table that was not explicitly defined inside the workspace is an external SOURCE or model
         const inferredKind: NodeKind = ref.startsWith('v_') || ref.startsWith('vw_')
           ? 'view'
           : ref.startsWith('stg_') || ref.startsWith('int_') || ref.startsWith('fct_') || ref.startsWith('dim_')
@@ -438,7 +500,7 @@ export function parseFiles(files: { name: string; path: string; content: string 
     }
   }
 
-  // 4. Build Edge List
+  // 4. Build unique edges
   const edges: Edge[] = []
   for (const [targetName, data] of nodeMap) {
     for (const sourceRef of data.refs) {
@@ -462,37 +524,91 @@ export function parseFiles(files: { name: string; path: string; content: string 
     }
   }
 
-  // 5. Compute Depth & Topological Layout
+  // 5. Robust DAG Topological Layering with Cycle Prevention
   const depths = new Map<string, number>()
-  const visited = new Set<string>()
+  const inDegree = new Map<string, number>()
+  const adj = new Map<string, string[]>()
 
-  function computeDepth(name: string): number {
-    if (depths.has(name)) return depths.get(name)!
-    if (visited.has(name)) return 0
-    visited.add(name)
-    const incoming = edges.filter((e) => e.to === name)
-    const depth = incoming.length === 0 ? 0 : Math.max(...incoming.map((e) => computeDepth(e.from) + 1))
-    depths.set(name, depth)
-    return depth
+  for (const name of nodeMap.keys()) {
+    inDegree.set(name, 0)
+    adj.set(name, [])
   }
 
-  for (const name of nodeMap.keys()) computeDepth(name)
+  for (const edge of edges) {
+    if (adj.has(edge.from) && inDegree.has(edge.to)) {
+      adj.get(edge.from)!.push(edge.to)
+      inDegree.set(edge.to, (inDegree.get(edge.to) || 0) + 1)
+    }
+  }
 
-  const maxDepth = Math.max(0, ...depths.values())
+  // Kahn's algorithm queue
+  const queue: string[] = []
+  for (const [name, deg] of inDegree.entries()) {
+    if (deg === 0) {
+      queue.push(name)
+      depths.set(name, 0)
+    }
+  }
+
+  let processedCount = 0
+  while (queue.length > 0) {
+    const curr = queue.shift()!
+    processedCount++
+    const currDepth = depths.get(curr) ?? 0
+
+    for (const neighbor of adj.get(curr) || []) {
+      const nextDepth = Math.max(depths.get(neighbor) ?? 0, currDepth + 1)
+      depths.set(neighbor, nextDepth)
+
+      const remaining = (inDegree.get(neighbor) || 1) - 1
+      inDegree.set(neighbor, remaining)
+      if (remaining === 0) {
+        queue.push(neighbor)
+      }
+    }
+  }
+
+  // Handle any remaining cycle nodes
+  for (const name of nodeMap.keys()) {
+    if (!depths.has(name)) {
+      depths.set(name, 0)
+    }
+  }
+
+  // Group into columns
   const layoutCols = new Map<number, string[]>()
   for (const [name, depth] of depths) {
     if (!layoutCols.has(depth)) layoutCols.set(depth, [])
     layoutCols.get(depth)!.push(name)
   }
 
+  // Barycentric sorting for clean horizontal alignment
+  const sortedDepths = [...layoutCols.keys()].sort((a, b) => a - b)
+  const nodeOrder = new Map<string, number>()
+
+  for (const depth of sortedDepths) {
+    const colNodes = layoutCols.get(depth)!
+    if (depth > 0) {
+      colNodes.sort((a, b) => {
+        const parentsA = edges.filter((e) => e.to === a).map((e) => nodeOrder.get(e.from) ?? 0)
+        const parentsB = edges.filter((e) => e.to === b).map((e) => nodeOrder.get(e.from) ?? 0)
+        const avgA = parentsA.length > 0 ? parentsA.reduce((sum, v) => sum + v, 0) / parentsA.length : 0
+        const avgB = parentsB.length > 0 ? parentsB.reduce((sum, v) => sum + v, 0) / parentsB.length : 0
+        return avgA - avgB
+      })
+    }
+    colNodes.forEach((name, idx) => nodeOrder.set(name, idx))
+  }
+
+  // Build final positioned nodes
   const nodes: LineageNode[] = []
   for (const [name, data] of nodeMap) {
     const depth = depths.get(name) ?? 0
     const col = layoutCols.get(depth) ?? [name]
     const idx = col.indexOf(name)
-    const colCount = col.length
-    const x = maxDepth === 0 ? 50 : 8 + (depth / maxDepth) * 82
-    const y = colCount === 1 ? 48 : 12 + (idx / (colCount - 1)) * 74
+
+    const x = START_X + depth * (NODE_WIDTH + COL_GAP)
+    const y = START_Y + idx * (NODE_HEIGHT + ROW_GAP)
 
     nodes.push({
       id: name,
@@ -509,29 +625,76 @@ export function parseFiles(files: { name: string; path: string; content: string 
   return { nodes, edges }
 }
 
-export function buildConnectorPaths(nodesArr: LineageNode[], edgesArr: Edge[], selectedId: string | null) {
+/**
+ * Pixel-Perfect Connector Curve Generator
+ * Calculates individual cubic bezier paths linking exactly from right-center port
+ * of the source card directly to the left-center port of the target card.
+ */
+export function buildConnectorPaths(
+  nodesArr: LineageNode[],
+  edgesArr: Edge[],
+  selectedId: string | null,
+): { edges: ConnectorEdge[]; normal: string; highlight: string } {
   const pos = new Map(nodesArr.map((n) => [n.id, { x: n.x, y: n.y }]))
-  const normal: string[] = []
-  const highlight: string[] = []
+  const connectors: ConnectorEdge[] = []
+  const normalPaths: string[] = []
+  const highlightPaths: string[] = []
 
   for (const edge of edgesArr) {
     const from = pos.get(edge.from)
     const to = pos.get(edge.to)
     if (!from || !to) continue
-    const x1 = from.x * 12 + 80
-    const y1 = from.y * 7 + 25
-    const x2 = to.x * 12 + 10
-    const y2 = to.y * 7 + 25
-    const dx = Math.max(30, (x2 - x1) * 0.5)
-    const d = `M${x1},${y1} C${x1 + dx},${y1} ${x2 - dx},${y2} ${x2},${y2}`
-    if (selectedId && (edge.from === selectedId || edge.to === selectedId)) {
-      highlight.push(d)
+
+    // Start at right middle of source node card
+    const x1 = from.x + NODE_WIDTH
+    const y1 = from.y + NODE_HEIGHT / 2
+
+    // End at left middle of target node card
+    const x2 = to.x
+    const y2 = to.y + NODE_HEIGHT / 2
+
+    let d: string
+    if (x2 >= x1) {
+      // Standard left-to-right flow with smooth horizontal tangents
+      const dx = Math.max(35, Math.min(140, (x2 - x1) * 0.48))
+      d = `M ${x1} ${y1} C ${x1 + dx} ${y1}, ${x2 - dx} ${y2}, ${x2} ${y2}`
     } else {
-      normal.push(d)
+      // Backward or same-column curve
+      const dy = y2 >= y1 ? 55 : -55
+      d = `M ${x1} ${y1} C ${x1 + 60} ${y1 + dy}, ${x2 - 60} ${y2 + dy}, ${x2} ${y2}`
     }
+
+    const isUpstream = selectedId === edge.to
+    const isDownstream = selectedId === edge.from
+    const isHighlighted = isUpstream || isDownstream
+
+    if (isHighlighted) {
+      highlightPaths.push(d)
+    } else {
+      normalPaths.push(d)
+    }
+
+    connectors.push({
+      id: `${edge.from}-->${edge.to}`,
+      from: edge.from,
+      to: edge.to,
+      d,
+      x1,
+      y1,
+      x2,
+      y2,
+      isHighlighted,
+      isUpstream,
+      isDownstream,
+      columns: edge.columns,
+    })
   }
 
-  return { normal: normal.join(' '), highlight: highlight.join(' ') }
+  return {
+    edges: connectors,
+    normal: normalPaths.join(' '),
+    highlight: highlightPaths.join(' '),
+  }
 }
 
 export function groupByDir(nodesArr: LineageNode[]): TreeGroup[] {
@@ -556,6 +719,11 @@ export function groupByDir(nodesArr: LineageNode[]): TreeGroup[] {
 }
 
 export function getDemoPipeline(): { nodes: LineageNode[]; edges: Edge[]; projectName: string } {
+  const col0_x = START_X
+  const col1_x = START_X + (NODE_WIDTH + COL_GAP)
+  const col2_x = START_X + 2 * (NODE_WIDTH + COL_GAP)
+  const col3_x = START_X + 3 * (NODE_WIDTH + COL_GAP)
+
   const nodes: LineageNode[] = [
     {
       id: 'raw_stripe_charges',
@@ -563,8 +731,8 @@ export function getDemoPipeline(): { nodes: LineageNode[]; edges: Edge[]; projec
       kind: 'source',
       meta: 'SOURCE • sources/stripe.yml',
       filePath: 'sources/stripe.yml',
-      x: 6,
-      y: 18,
+      x: col0_x,
+      y: START_Y,
       columns: [
         { name: 'id', type: 'VARCHAR', sources: [] },
         { name: 'amount', type: 'DECIMAL', sources: [] },
@@ -579,8 +747,8 @@ export function getDemoPipeline(): { nodes: LineageNode[]; edges: Edge[]; projec
       kind: 'source',
       meta: 'SOURCE • sources/postgres.yml',
       filePath: 'sources/postgres.yml',
-      x: 6,
-      y: 48,
+      x: col0_x,
+      y: START_Y + (NODE_HEIGHT + ROW_GAP),
       columns: [
         { name: 'user_id', type: 'VARCHAR', sources: [] },
         { name: 'email', type: 'VARCHAR', sources: [] },
@@ -594,8 +762,8 @@ export function getDemoPipeline(): { nodes: LineageNode[]; edges: Edge[]; projec
       kind: 'source',
       meta: 'SOURCE • sources/kafka.yml',
       filePath: 'sources/kafka.yml',
-      x: 6,
-      y: 78,
+      x: col0_x,
+      y: START_Y + 2 * (NODE_HEIGHT + ROW_GAP),
       columns: [
         { name: 'event_id', type: 'VARCHAR', sources: [] },
         { name: 'user_id', type: 'VARCHAR', sources: [] },
@@ -609,8 +777,8 @@ export function getDemoPipeline(): { nodes: LineageNode[]; edges: Edge[]; projec
       kind: 'model',
       meta: 'MODEL • staging/stg_payments.sql',
       filePath: 'models/staging/stg_payments.sql',
-      x: 32,
-      y: 22,
+      x: col1_x,
+      y: START_Y,
       columns: [
         { name: 'payment_id', type: 'VARCHAR', sources: [{ table: 'raw_stripe_charges', column: 'id' }] },
         { name: 'amount_usd', type: 'DECIMAL', sources: [{ table: 'raw_stripe_charges', column: 'amount' }] },
@@ -623,8 +791,8 @@ export function getDemoPipeline(): { nodes: LineageNode[]; edges: Edge[]; projec
       kind: 'model',
       meta: 'MODEL • staging/stg_customers.sql',
       filePath: 'models/staging/stg_customers.sql',
-      x: 32,
-      y: 52,
+      x: col1_x,
+      y: START_Y + (NODE_HEIGHT + ROW_GAP),
       columns: [
         { name: 'customer_id', type: 'VARCHAR', sources: [{ table: 'raw_postgres_users', column: 'user_id' }] },
         { name: 'email_domain', type: 'VARCHAR', sources: [{ table: 'raw_postgres_users', column: 'email' }] },
@@ -637,8 +805,8 @@ export function getDemoPipeline(): { nodes: LineageNode[]; edges: Edge[]; projec
       kind: 'table',
       meta: 'TABLE • marts/fct_orders.sql',
       filePath: 'models/marts/fct_orders.sql',
-      x: 60,
-      y: 26,
+      x: col2_x,
+      y: START_Y,
       columns: [
         { name: 'order_key', type: 'VARCHAR', sources: [{ table: 'stg_payments', column: 'payment_id' }] },
         { name: 'customer_id', type: 'VARCHAR', sources: [{ table: 'stg_customers', column: 'customer_id' }] },
@@ -651,8 +819,8 @@ export function getDemoPipeline(): { nodes: LineageNode[]; edges: Edge[]; projec
       kind: 'table',
       meta: 'TABLE • marts/dim_customer_ltv.sql',
       filePath: 'models/marts/dim_customer_ltv.sql',
-      x: 60,
-      y: 64,
+      x: col2_x,
+      y: START_Y + (NODE_HEIGHT + ROW_GAP),
       columns: [
         { name: 'customer_id', type: 'VARCHAR', sources: [{ table: 'stg_customers', column: 'customer_id' }] },
         { name: 'total_spend', type: 'DECIMAL', sources: [{ table: 'fct_orders_mart', column: 'gross_revenue' }] },
@@ -665,8 +833,8 @@ export function getDemoPipeline(): { nodes: LineageNode[]; edges: Edge[]; projec
       kind: 'view',
       meta: 'VIEW • views/exec_revenue.sql',
       filePath: 'views/exec_revenue.sql',
-      x: 88,
-      y: 24,
+      x: col3_x,
+      y: START_Y,
       columns: [
         { name: 'mrr_usd', type: 'DECIMAL', sources: [{ table: 'fct_orders_mart', column: 'gross_revenue' }] },
         { name: 'active_paying_customers', type: 'INTEGER', sources: [{ table: 'dim_customer_ltv', column: 'customer_id' }] },
@@ -678,8 +846,8 @@ export function getDemoPipeline(): { nodes: LineageNode[]; edges: Edge[]; projec
       kind: 'view',
       meta: 'VIEW • views/churn_risk.sql',
       filePath: 'views/churn_risk.sql',
-      x: 88,
-      y: 68,
+      x: col3_x,
+      y: START_Y + (NODE_HEIGHT + ROW_GAP),
       columns: [
         { name: 'customer_id', type: 'VARCHAR', sources: [{ table: 'dim_customer_ltv', column: 'customer_id' }] },
         { name: 'churn_probability', type: 'FLOAT', sources: [] },
@@ -703,37 +871,42 @@ export function getDemoPipeline(): { nodes: LineageNode[]; edges: Edge[]; projec
 }
 
 export function generateSvgExport(nodes: LineageNode[], edges: Edge[], title = 'LineageForge Graph'): string {
-  const width = 1400
-  const height = 900
-  const pos = new Map(nodes.map((n) => [n.id, { x: (n.x / 100) * (width - 300) + 50, y: (n.y / 100) * (height - 160) + 80 }]))
+  let maxX = 1200
+  let maxY = 800
+  for (const n of nodes) {
+    if (n.x + NODE_WIDTH + 80 > maxX) maxX = n.x + NODE_WIDTH + 80
+    if (n.y + NODE_HEIGHT + 80 > maxY) maxY = n.y + NODE_HEIGHT + 80
+  }
+
+  const pos = new Map(nodes.map((n) => [n.id, { x: n.x, y: n.y }]))
 
   const paths = edges.map((e) => {
     const from = pos.get(e.from)
     const to = pos.get(e.to)
     if (!from || !to) return ''
-    const x1 = from.x + 160, y1 = from.y + 28
-    const x2 = to.x, y2 = to.y + 28
-    const dx = (x2 - x1) * 0.5
-    return `<path d="M${x1},${y1} C${x1 + dx},${y1} ${x2 - dx},${y2} ${x2},${y2}" stroke="#a855f7" stroke-width="2" fill="none" opacity="0.75" marker-end="url(#arrow)" />`
+    const x1 = from.x + NODE_WIDTH
+    const y1 = from.y + NODE_HEIGHT / 2
+    const x2 = to.x
+    const y2 = to.y + NODE_HEIGHT / 2
+    const dx = Math.max(35, Math.min(140, (x2 - x1) * 0.48))
+    return `<path d="M ${x1} ${y1} C ${x1 + dx} ${y1}, ${x2 - dx} ${y2}, ${x2} ${y2}" stroke="#00f2fe" stroke-width="2.2" fill="none" opacity="0.85" marker-end="url(#arrow)" />`
   }).filter(Boolean).join('\n')
 
   const nodeElements = nodes.map((n) => {
-    const p = pos.get(n.id)
-    if (!p) return ''
     const color = n.kind === 'table' ? '#4facfe' : n.kind === 'view' ? '#43e97b' : n.kind === 'source' ? '#fa709a' : '#00f2fe'
     return `
-      <g transform="translate(${p.x}, ${p.y})">
-        <rect width="160" height="56" rx="8" fill="#121222" stroke="${color}" stroke-width="1.5" filter="url(#glow)" />
-        <circle cx="20" cy="28" r="8" fill="${color}" opacity="0.3" />
-        <circle cx="20" cy="28" r="4" fill="${color}" />
-        <text x="36" y="24" fill="#ffffff" font-family="Inter, sans-serif" font-size="11" font-weight="600">${n.name}</text>
-        <text x="36" y="38" fill="#a0a0b8" font-family="JetBrains Mono, monospace" font-size="9">${n.kind.toUpperCase()}</text>
+      <g transform="translate(${n.x}, ${n.y})">
+        <rect width="${NODE_WIDTH}" height="${NODE_HEIGHT}" rx="12" fill="#121428" stroke="${color}" stroke-width="1.5" filter="url(#glow)" />
+        <circle cx="22" cy="30" r="10" fill="${color}" opacity="0.25" />
+        <circle cx="22" cy="30" r="5" fill="${color}" />
+        <text x="42" y="26" fill="#ffffff" font-family="JetBrains Mono, monospace" font-size="12" font-weight="bold">${n.name}</text>
+        <text x="42" y="42" fill="#a0a0b8" font-family="JetBrains Mono, monospace" font-size="9" font-weight="bold" letter-spacing="1px">${n.kind.toUpperCase()}</text>
       </g>
     `
   }).join('\n')
 
   return `<?xml version="1.0" standalone="no"?>
-<svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" xmlns="http://www.w3.org/2000/svg">
+<svg width="${maxX}" height="${maxY}" viewBox="0 0 ${maxX} ${maxY}" xmlns="http://www.w3.org/2000/svg">
   <defs>
     <radialGradient id="bg-glow" cx="50%" cy="50%" r="50%">
       <stop offset="0%" stop-color="#1a1a2e" />
@@ -743,8 +916,8 @@ export function generateSvgExport(nodes: LineageNode[], edges: Edge[], title = '
       <feGaussianBlur stdDeviation="4" result="blur" />
       <feComposite in="SourceGraphic" in2="blur" operator="over" />
     </filter>
-    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
-      <path d="M 0 1 L 10 5 L 0 9 z" fill="#a855f7" />
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#00f2fe" />
     </marker>
   </defs>
   <rect width="100%" height="100%" fill="url(#bg-glow)" />
