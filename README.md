@@ -74,9 +74,7 @@ LineageForge is a modern, high-performance web application designed to parse, vi
    ```text
    http://localhost:3000
    ```
-
----
-
+LineageForge includes a simple Python GUI launcher—just double-click the server_gui.py file and a clean interface will appear, allowing you to start the local development server, monitor its status, and open the application in your browser with a single click. This eliminates the need to navigate the command line, making it the perfect option for designers, product managers, or anyone who prefers a visual experience over typing commands
 ## 🛠️ Build for Production
 
 To create an optimized production build:
